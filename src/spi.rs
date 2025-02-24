@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 ///
 /// This is a helper type to support multiple embedded-hal versions simultaneously.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Polarity {
+pub struct FTDIPolarity {
     /// MPSSE command used to clock data in and out simultaneously.
     ///
     /// This is set by [`Spi::set_clock_polarity`].
@@ -18,14 +18,14 @@ pub struct Polarity {
     clk_out: ClockDataOut,
 }
 
-impl From<eh0::spi::Polarity> for Polarity {
-    fn from(cpol: eh0::spi::Polarity) -> Self {
-        match cpol {
-            eh0::spi::Polarity::IdleLow => Polarity {
+impl From<eh1::spi::Polarity> for FTDIPolarity {
+    fn from(mode: eh1::spi::Polarity) -> Self {
+        match mode {
+            eh1::spi::Polarity::IdleLow => FTDIPolarity {
                 clk: ClockData::MsbPosIn,
                 clk_out: ClockDataOut::MsbNeg,
             },
-            eh0::spi::Polarity::IdleHigh => Polarity {
+            eh1::spi::Polarity::IdleHigh => FTDIPolarity {
                 clk: ClockData::MsbNegIn,
                 clk_out: ClockDataOut::MsbPos,
             },
@@ -33,22 +33,7 @@ impl From<eh0::spi::Polarity> for Polarity {
     }
 }
 
-impl From<eh1::spi::Polarity> for Polarity {
-    fn from(cpol: eh1::spi::Polarity) -> Self {
-        match cpol {
-            eh1::spi::Polarity::IdleLow => Polarity {
-                clk: ClockData::MsbPosIn,
-                clk_out: ClockDataOut::MsbNeg,
-            },
-            eh1::spi::Polarity::IdleHigh => Polarity {
-                clk: ClockData::MsbNegIn,
-                clk_out: ClockDataOut::MsbPos,
-            },
-        }
-    }
-}
-
-impl Default for Polarity {
+impl Default for FTDIPolarity {
     fn default() -> Self {
         Self {
             clk: ClockData::MsbPosIn,
@@ -69,7 +54,7 @@ pub struct Spi<Device: MpsseCmdExecutor> {
     /// Parent FTDI device.
     mtx: Arc<Mutex<FtInner<Device>>>,
     /// SPI polarity
-    pol: Polarity,
+    pol: FTDIPolarity,
 }
 
 impl<Device, E> Spi<Device>
@@ -78,7 +63,10 @@ where
     E: std::error::Error,
     Error<E>: From<E>,
 {
-    pub(crate) fn new(mtx: Arc<Mutex<FtInner<Device>>>) -> Result<Spi<Device>, Error<E>> {
+    pub(crate) fn new(
+        mtx: Arc<Mutex<FtInner<Device>>>,
+        mode: eh1::spi::Mode,
+    ) -> Result<Spi<Device>, Error<E>> {
         {
             let mut lock = mtx.lock().expect("Failed to aquire FTDI mutex");
             lock.allocate_pin(0, PinUse::Spi);
@@ -95,112 +83,31 @@ where
                 .set_gpio_lower(lock.value, lock.direction)
                 .send_immediate();
             lock.ft.send(cmd.as_slice())?;
+
+            match mode.phase {
+                eh1::spi::Phase::CaptureOnSecondTransition => {
+                    lock.ft.send(
+                        MpsseCmdBuilder::new()
+                            .enable_3phase_data_clocking()
+                            .send_immediate()
+                            .as_slice(),
+                    )?;
+                }
+                eh1::spi::Phase::CaptureOnFirstTransition => {
+                    lock.ft.send(
+                        MpsseCmdBuilder::new()
+                            .disable_3phase_data_clocking()
+                            .send_immediate()
+                            .as_slice(),
+                    )?;
+                }
+            }
         }
 
         Ok(Spi {
             mtx,
-            pol: Default::default(),
+            pol: mode.polarity.into(),
         })
-    }
-
-    /// Set the SPI clock polarity.
-    ///
-    /// FTD2XX devices only supports [SPI mode] 0 and 2, clock phase is fixed.
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// use eh1::spi::Polarity;
-    /// use ftdi_embedded_hal as hal;
-    ///
-    /// # #[cfg(feature = "libftd2xx")]
-    /// # {
-    /// let device = libftd2xx::Ft2232h::with_description("Dual RS232-HS A")?;
-    /// let hal = hal::FtHal::init_freq(device, 3_000_000)?;
-    /// let mut spi = hal.spi()?;
-    /// spi.set_clock_polarity(Polarity::IdleLow);
-    /// # }
-    /// # Ok::<(), std::boxed::Box<dyn std::error::Error>>(())
-    /// ```
-    ///
-    /// [SPI mode]: https://en.wikipedia.org/wiki/Serial_Peripheral_Interface#Mode_numbers
-    pub fn set_clock_polarity<P: Into<Polarity>>(&mut self, cpol: P) {
-        self.pol = cpol.into()
-    }
-}
-
-impl<Device, E> eh0::blocking::spi::Write<u8> for Spi<Device>
-where
-    Device: MpsseCmdExecutor<Error = E>,
-    E: std::error::Error,
-    Error<E>: From<E>,
-{
-    type Error = Error<E>;
-
-    fn write(&mut self, words: &[u8]) -> Result<(), Error<E>> {
-        let cmd: MpsseCmdBuilder = MpsseCmdBuilder::new()
-            .clock_data_out(self.pol.clk_out, words)
-            .send_immediate();
-
-        let mut lock = self.mtx.lock().expect("Failed to aquire FTDI mutex");
-        lock.ft.send(cmd.as_slice())?;
-
-        Ok(())
-    }
-}
-
-impl<Device, E> eh0::blocking::spi::Transfer<u8> for Spi<Device>
-where
-    Device: MpsseCmdExecutor<Error = E>,
-    E: std::error::Error,
-    Error<E>: From<E>,
-{
-    type Error = Error<E>;
-
-    fn transfer<'w>(&mut self, words: &'w mut [u8]) -> Result<&'w [u8], Error<E>> {
-        let cmd: MpsseCmdBuilder = MpsseCmdBuilder::new()
-            .clock_data(self.pol.clk, words)
-            .send_immediate();
-
-        let mut lock = self.mtx.lock().expect("Failed to aquire FTDI mutex");
-        lock.ft.send(cmd.as_slice())?;
-        lock.ft.recv(words)?;
-
-        Ok(words)
-    }
-}
-
-impl<Device, E> eh0::spi::FullDuplex<u8> for Spi<Device>
-where
-    Device: MpsseCmdExecutor<Error = E>,
-    E: std::error::Error,
-    Error<E>: From<E>,
-{
-    type Error = Error<E>;
-
-    fn read(&mut self) -> nb::Result<u8, Error<E>> {
-        let mut buf: [u8; 1] = [0];
-        let cmd: MpsseCmdBuilder = MpsseCmdBuilder::new()
-            .clock_data(self.pol.clk, &buf)
-            .send_immediate();
-
-        let mut lock = self.mtx.lock().expect("Failed to aquire FTDI mutex");
-        match lock.ft.xfer(cmd.as_slice(), &mut buf) {
-            Ok(()) => Ok(buf[0]),
-            Err(e) => Err(nb::Error::Other(Error::from(e))),
-        }
-    }
-
-    fn send(&mut self, byte: u8) -> nb::Result<(), Error<E>> {
-        let cmd: MpsseCmdBuilder = MpsseCmdBuilder::new()
-            .clock_data_out(self.pol.clk_out, &[byte])
-            .send_immediate();
-
-        let mut lock = self.mtx.lock().expect("Failed to aquire FTDI mutex");
-        match lock.ft.send(cmd.as_slice()) {
-            Ok(()) => Ok(()),
-            Err(e) => Err(nb::Error::Other(Error::from(e))),
-        }
     }
 }
 
@@ -323,7 +230,7 @@ where
 
 pub struct SpiDeviceBus<'a, Device: MpsseCmdExecutor> {
     lock: MutexGuard<'a, FtInner<Device>>,
-    pol: Polarity,
+    pol: FTDIPolarity,
 }
 
 impl<Device, E> eh1::spi::ErrorType for SpiDeviceBus<'_, Device>
@@ -401,9 +308,11 @@ pub struct SpiDevice<Device: MpsseCmdExecutor> {
     /// Parent FTDI device.
     mtx: Arc<Mutex<FtInner<Device>>>,
     /// SPI polarity
-    pol: Polarity,
+    pol: FTDIPolarity,
     /// Chip select pin index.  0-7 for the FT232H.
     cs_idx: u8,
+    /// The embedded_hal SPI mode value.
+    mode: eh1::spi::Mode,
 }
 
 impl<Device, E> SpiDevice<Device>
@@ -415,6 +324,7 @@ where
     pub(crate) fn new(
         mtx: Arc<Mutex<FtInner<Device>>>,
         cs_idx: u8,
+        mode: eh1::spi::Mode,
     ) -> Result<SpiDevice<Device>, Error<E>> {
         {
             let mut lock = mtx.lock().expect("Failed to aquire FTDI mutex");
@@ -429,6 +339,27 @@ where
             lock.direction &= !(0x07 | cs_mask);
             // set SCK (AD0) and MOSI (AD1), and CS as output pins
             lock.direction |= 0x03 | cs_mask;
+            // Ensure CS is not asserted.
+            lock.value |= cs_mask;
+
+            match mode.phase {
+                eh1::spi::Phase::CaptureOnSecondTransition => {
+                    lock.ft.send(
+                        MpsseCmdBuilder::new()
+                            .enable_3phase_data_clocking()
+                            .send_immediate()
+                            .as_slice(),
+                    )?;
+                }
+                eh1::spi::Phase::CaptureOnFirstTransition => {
+                    lock.ft.send(
+                        MpsseCmdBuilder::new()
+                            .disable_3phase_data_clocking()
+                            .send_immediate()
+                            .as_slice(),
+                    )?;
+                }
+            }
 
             // set GPIO pins to new state
             let cmd: MpsseCmdBuilder = MpsseCmdBuilder::new()
@@ -439,42 +370,18 @@ where
 
         Ok(Self {
             mtx,
-            pol: Default::default(),
+            pol: mode.polarity.into(),
             cs_idx,
+            mode,
         })
     }
 
     pub(crate) fn cs_mask(&self) -> u8 {
         1 << self.cs_idx
     }
-
-    /// Set the SPI clock polarity.
-    ///
-    /// FTD2XX devices only supports [SPI mode] 0 and 2, clock phase is fixed.
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// use eh1::spi::Polarity;
-    /// use ftdi_embedded_hal as hal;
-    ///
-    /// # #[cfg(feature = "libftd2xx")]
-    /// # {
-    /// let device = libftd2xx::Ft2232h::with_description("Dual RS232-HS A")?;
-    /// let hal = hal::FtHal::init_freq(device, 3_000_000)?;
-    /// let mut spi = hal.spi_device(3)?;
-    /// spi.set_clock_polarity(Polarity::IdleLow);
-    /// # }
-    /// # Ok::<(), std::boxed::Box<dyn std::error::Error>>(())
-    /// ```
-    ///
-    /// [SPI mode]: https://en.wikipedia.org/wiki/Serial_Peripheral_Interface#Mode_numbers
-    pub fn set_clock_polarity<P: Into<Polarity>>(&mut self, cpol: P) {
-        self.pol = cpol.into()
-    }
 }
 
-impl<Device, E> eh1::spi::ErrorType for &SpiDevice<Device>
+impl<Device, E> eh1::spi::ErrorType for SpiDevice<Device>
 where
     Device: MpsseCmdExecutor<Error = E>,
     E: std::error::Error,
@@ -483,7 +390,7 @@ where
     type Error = Error<E>;
 }
 
-impl<'a, Device, E> eh1::spi::SpiDevice for &'a SpiDevice<Device>
+impl<'a, Device, E> eh1::spi::SpiDevice for SpiDevice<Device>
 where
     Device: MpsseCmdExecutor<Error = E>,
     E: std::error::Error,
@@ -498,16 +405,32 @@ where
             self.mtx.lock().expect("Failed to aquire FTDI mutex");
         let direction: u8 = lock.direction;
 
-        // assert the chip select pin
-        let value_cs_asserted: u8 = lock.value & !self.cs_mask();
+        let sck_idle_bit = match self.mode.polarity {
+            eh1::spi::Polarity::IdleLow => 0x00,
+            eh1::spi::Polarity::IdleHigh => 0x01,
+        };
+
+        // Ensure SCLK is set to the value it idles at by clearing it then OR.
+        lock.value = (lock.value & !0x01) | sck_idle_bit;
+        let value = lock.value;
         lock.ft.send(
             MpsseCmdBuilder::new()
-                .set_gpio_lower(value_cs_asserted, direction)
+                .set_gpio_lower(value, direction)
                 .send_immediate()
                 .as_slice(),
         )?;
 
-        let mut bus: SpiDeviceBus<'a, Device> = SpiDeviceBus {
+        // Turn CS off.
+        lock.value = lock.value & !self.cs_mask();
+        let value = lock.value;
+        lock.ft.send(
+            MpsseCmdBuilder::new()
+                .set_gpio_lower(value, direction)
+                .send_immediate()
+                .as_slice(),
+        )?;
+
+        let mut bus: SpiDeviceBus<Device> = SpiDeviceBus {
             lock,
             pol: self.pol,
         };
@@ -540,11 +463,11 @@ where
 
         let mut lock: MutexGuard<FtInner<Device>> = bus.lock;
 
-        // deassert the chip select pin
-        let value_cs_deasserted: u8 = lock.value | self.cs_mask();
+        lock.value = lock.value | self.cs_mask();
+        let value = lock.value;
         lock.ft.send(
             MpsseCmdBuilder::new()
-                .set_gpio_lower(value_cs_deasserted, direction)
+                .set_gpio_lower(value, direction)
                 .send_immediate()
                 .as_slice(),
         )?;

@@ -415,8 +415,8 @@ where
     /// # }
     /// # Ok::<(), std::boxed::Box<dyn std::error::Error>>(())
     /// ```
-    pub fn spi(&self) -> Result<Spi<Device>, Error<E>> {
-        Spi::new(self.mtx.clone())
+    pub fn spi(&self, mode: eh1::spi::Mode) -> Result<Spi<Device>, Error<E>> {
+        Spi::new(self.mtx.clone(), mode)
     }
 
     /// Aquire the SPI peripheral with a chip select pin.
@@ -445,8 +445,8 @@ where
     /// # }
     /// # Ok::<(), std::boxed::Box<dyn std::error::Error>>(())
     /// ```
-    pub fn spi_device(&self, cs_idx: u8) -> Result<SpiDevice<Device>, Error<E>> {
-        SpiDevice::new(self.mtx.clone(), cs_idx)
+    pub fn spi_device(&self, cs_idx: u8, mode: eh1::spi::Mode) -> Result<SpiDevice<Device>, Error<E>> {
+        SpiDevice::new(self.mtx.clone(), cs_idx, mode)
     }
 
     /// Aquire the I2C peripheral for the FT232H.
